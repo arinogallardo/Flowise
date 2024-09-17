@@ -18,9 +18,10 @@ import {
     ISeqAgentNode,
     IDatabaseEntity,
     IUsedTool,
-    IDocument
+    IDocument,
+    IStateWithMessages
 } from '../../../src/Interface'
-import { ToolCallingAgentOutputParser, AgentExecutor, SOURCE_DOCUMENTS_PREFIX } from '../../../src/agents'
+import { ToolCallingAgentOutputParser, AgentExecutor, SOURCE_DOCUMENTS_PREFIX, ARTIFACTS_PREFIX } from '../../../src/agents'
 import { getInputVariables, getVars, handleEscapeCharacters, prepareSandboxVars } from '../../../src/utils'
 import {
     customGet,
@@ -29,7 +30,8 @@ import {
     transformObjectPropertyToFunction,
     restructureMessages,
     MessagesState,
-    RunnableCallable
+    RunnableCallable,
+    checkMessageHistory
 } from '../commonUtils'
 import { END, StateGraph } from '@langchain/langgraph'
 import { StructuredTool } from '@langchain/core/tools'
@@ -149,6 +151,31 @@ const defaultFunc = `const result = $flow.output;
 return {
   aggregate: [result.content]
 };`
+
+const messageHistoryExample = `const { AIMessage, HumanMessage, ToolMessage } = require('@langchain/core/messages');
+
+return [
+    new HumanMessage("What is 333382 🦜 1932?"),
+    new AIMessage({
+        content: "",
+        tool_calls: [
+        {
+            id: "12345",
+            name: "calulator",
+            args: {
+                number1: 333382,
+                number2: 1932,
+                operation: "divide",
+            },
+        },
+        ],
+    }),
+    new ToolMessage({
+        tool_call_id: "12345",
+        content: "The answer is 172.558.",
+    }),
+    new AIMessage("The answer is 172.558."),
+]`
 const TAB_IDENTIFIER = 'selectedUpdateStateMemoryTab'
 
 class Agent_SeqAgents implements INode {
@@ -162,17 +189,19 @@ class Agent_SeqAgents implements INode {
     baseClasses: string[]
     inputs?: INodeParams[]
     badge?: string
+    documentation?: string
     outputs: INodeOutputsValue[]
 
     constructor() {
         this.label = 'Agent'
         this.name = 'seqAgent'
-        this.version = 1.0
+        this.version = 3.0
         this.type = 'Agent'
         this.icon = 'seqAgent.png'
         this.category = 'Sequential Agents'
         this.description = 'Agent that can execute tools'
         this.baseClasses = [this.type]
+        this.documentation = 'https://docs.flowiseai.com/using-flowise/agentflows/sequential-agents#id-4.-agent-node'
         this.inputs = [
             {
                 label: 'Agent Name',
@@ -198,15 +227,27 @@ class Agent_SeqAgents implements INode {
                 additionalParams: true
             },
             {
+                label: 'Messages History',
+                name: 'messageHistory',
+                description:
+                    'Return a list of messages between System Prompt and Human Prompt. This is useful when you want to provide few shot examples',
+                type: 'code',
+                hideCodeExecute: true,
+                codeExample: messageHistoryExample,
+                optional: true,
+                additionalParams: true
+            },
+            {
                 label: 'Tools',
                 name: 'tools',
                 type: 'Tool',
-                list: true
+                list: true,
+                optional: true
             },
             {
-                label: 'Start | Agent | LLM | Tool Node',
+                label: 'Start | Agent | Condition | LLM | Tool Node',
                 name: 'sequentialNode',
-                type: 'Start | Agent | LLMNode | ToolNode',
+                type: 'Start | Agent | Condition | LLMNode | ToolNode',
                 list: true
             },
             {
@@ -423,6 +464,8 @@ class Agent_SeqAgents implements INode {
                     llm,
                     interrupt,
                     agent: await createAgent(
+                        nodeData,
+                        options,
                         agentName,
                         state,
                         llm,
@@ -512,6 +555,8 @@ class Agent_SeqAgents implements INode {
 }
 
 async function createAgent(
+    nodeData: INodeData,
+    options: ICommonObject,
     agentName: string,
     state: ISeqAgentsState,
     llm: BaseChatModel,
@@ -532,7 +577,8 @@ async function createAgent(
         if (systemPrompt) promptArrays.unshift(['system', systemPrompt])
         if (humanPrompt) promptArrays.push(['human', humanPrompt])
 
-        const prompt = ChatPromptTemplate.fromMessages(promptArrays)
+        let prompt = ChatPromptTemplate.fromMessages(promptArrays)
+        prompt = await checkMessageHistory(nodeData, options, prompt, promptArrays, systemPrompt)
 
         if (multiModalMessageContent.length) {
             const msg = HumanMessagePromptTemplate.fromTemplate([...multiModalMessageContent])
@@ -594,7 +640,9 @@ async function createAgent(
         if (systemPrompt) promptArrays.unshift(['system', systemPrompt])
         if (humanPrompt) promptArrays.push(['human', humanPrompt])
 
-        const prompt = ChatPromptTemplate.fromMessages(promptArrays)
+        let prompt = ChatPromptTemplate.fromMessages(promptArrays)
+        prompt = await checkMessageHistory(nodeData, options, prompt, promptArrays, systemPrompt)
+
         if (multiModalMessageContent.length) {
             const msg = HumanMessagePromptTemplate.fromTemplate([...multiModalMessageContent])
             prompt.promptMessages.splice(1, 0, msg)
@@ -621,7 +669,8 @@ async function createAgent(
         if (systemPrompt) promptArrays.unshift(['system', systemPrompt])
         if (humanPrompt) promptArrays.push(['human', humanPrompt])
 
-        const prompt = ChatPromptTemplate.fromMessages(promptArrays)
+        let prompt = ChatPromptTemplate.fromMessages(promptArrays)
+        prompt = await checkMessageHistory(nodeData, options, prompt, promptArrays, systemPrompt)
 
         if (multiModalMessageContent.length) {
             const msg = HumanMessagePromptTemplate.fromTemplate([...multiModalMessageContent])
@@ -689,13 +738,21 @@ async function agentNode(
 
             // If the last message is a tool message and is an interrupted message, format output into standard agent output
             if (lastMessage._getType() === 'tool' && lastMessage.additional_kwargs?.nodeId === nodeData.id) {
-                let formattedAgentResult: { output?: string; usedTools?: IUsedTool[]; sourceDocuments?: IDocument[] } = {}
+                let formattedAgentResult: {
+                    output?: string
+                    usedTools?: IUsedTool[]
+                    sourceDocuments?: IDocument[]
+                    artifacts?: ICommonObject[]
+                } = {}
                 formattedAgentResult.output = result.content
                 if (lastMessage.additional_kwargs?.usedTools) {
                     formattedAgentResult.usedTools = lastMessage.additional_kwargs.usedTools as IUsedTool[]
                 }
                 if (lastMessage.additional_kwargs?.sourceDocuments) {
                     formattedAgentResult.sourceDocuments = lastMessage.additional_kwargs.sourceDocuments as IDocument[]
+                }
+                if (lastMessage.additional_kwargs?.artifacts) {
+                    formattedAgentResult.artifacts = lastMessage.additional_kwargs.artifacts as ICommonObject[]
                 }
                 result = formattedAgentResult
             } else {
@@ -715,12 +772,18 @@ async function agentNode(
         if (result.sourceDocuments) {
             additional_kwargs.sourceDocuments = result.sourceDocuments
         }
+        if (result.artifacts) {
+            additional_kwargs.artifacts = result.artifacts
+        }
         if (result.output) {
             result.content = result.output
             delete result.output
         }
 
-        const outputContent = typeof result === 'string' ? result : result.content || result.output
+        let outputContent = typeof result === 'string' ? result : result.content || result.output
+
+        // remove invalid markdown image pattern: ![<some-string>](<some-string>)
+        outputContent = typeof outputContent === 'string' ? outputContent.replace(/!\[.*?\]\(.*?\)/g, '') : outputContent
 
         if (nodeData.inputs?.updateStateMemoryUI || nodeData.inputs?.updateStateMemoryCode) {
             let formattedOutput = {
@@ -754,6 +817,7 @@ const getReturnOutput = async (nodeData: INodeData, input: string, options: ICom
     const tabIdentifier = nodeData.inputs?.[`${TAB_IDENTIFIER}_${nodeData.id}`] as string
     const updateStateMemoryUI = nodeData.inputs?.updateStateMemoryUI as string
     const updateStateMemoryCode = nodeData.inputs?.updateStateMemoryCode as string
+    const updateStateMemory = nodeData.inputs?.updateStateMemory as string
 
     const selectedTab = tabIdentifier ? tabIdentifier.split(`_${nodeData.id}`)[0] : 'updateStateMemoryUI'
     const variables = await getVars(appDataSource, databaseEntities, nodeData)
@@ -766,6 +830,27 @@ const getReturnOutput = async (nodeData: INodeData, input: string, options: ICom
         output,
         state,
         vars: prepareSandboxVars(variables)
+    }
+
+    if (updateStateMemory && updateStateMemory !== 'updateStateMemoryUI' && updateStateMemory !== 'updateStateMemoryCode') {
+        try {
+            const parsedSchema = typeof updateStateMemory === 'string' ? JSON.parse(updateStateMemory) : updateStateMemory
+            const obj: ICommonObject = {}
+            for (const sch of parsedSchema) {
+                const key = sch.Key
+                if (!key) throw new Error(`Key is required`)
+                let value = sch.Value as string
+                if (value.startsWith('$flow')) {
+                    value = customGet(flow, sch.Value.replace('$flow.', ''))
+                } else if (value.startsWith('$vars')) {
+                    value = customGet(flow, sch.Value.replace('$', ''))
+                }
+                obj[key] = value
+            }
+            return obj
+        } catch (e) {
+            throw new Error(e)
+        }
     }
 
     if (selectedTab === 'updateStateMemoryUI' && updateStateMemoryUI) {
@@ -834,10 +919,35 @@ class ToolNode<T extends BaseMessage[] | MessagesState> extends RunnableCallable
     }
 
     private async run(input: BaseMessage[] | MessagesState, config: RunnableConfig): Promise<BaseMessage[] | MessagesState> {
-        const message = Array.isArray(input) ? input[input.length - 1] : input.messages[input.messages.length - 1]
+        let messages: BaseMessage[]
+
+        // Check if input is an array of BaseMessage[]
+        if (Array.isArray(input)) {
+            messages = input
+        }
+        // Check if input is IStateWithMessages
+        else if ((input as IStateWithMessages).messages) {
+            messages = (input as IStateWithMessages).messages
+        }
+        // Handle MessagesState type
+        else {
+            messages = (input as MessagesState).messages
+        }
+
+        // Get the last message
+        const message = messages[messages.length - 1]
 
         if (message._getType() !== 'ai') {
             throw new Error('ToolNode only accepts AIMessages as input.')
+        }
+
+        // Extract all properties except messages for IStateWithMessages
+        const { messages: _, ...inputWithoutMessages } = Array.isArray(input) ? { messages: input } : input
+        const ChannelsWithoutMessages = {
+            chatId: this.options.chatId,
+            sessionId: this.options.sessionId,
+            input: this.inputQuery,
+            state: inputWithoutMessages
         }
 
         const outputs = await Promise.all(
@@ -846,8 +956,14 @@ class ToolNode<T extends BaseMessage[] | MessagesState> extends RunnableCallable
                 if (tool === undefined) {
                     throw new Error(`Tool ${call.name} not found.`)
                 }
+                if (tool && (tool as any).setFlowObject) {
+                    // @ts-ignore
+                    tool.setFlowObject(ChannelsWithoutMessages)
+                }
                 let output = await tool.invoke(call.args, config)
                 let sourceDocuments: Document[] = []
+                let artifacts = []
+
                 if (output?.includes(SOURCE_DOCUMENTS_PREFIX)) {
                     const outputArray = output.split(SOURCE_DOCUMENTS_PREFIX)
                     output = outputArray[0]
@@ -858,12 +974,23 @@ class ToolNode<T extends BaseMessage[] | MessagesState> extends RunnableCallable
                         console.error('Error parsing source documents from tool')
                     }
                 }
+                if (output?.includes(ARTIFACTS_PREFIX)) {
+                    const outputArray = output.split(ARTIFACTS_PREFIX)
+                    output = outputArray[0]
+                    try {
+                        artifacts = JSON.parse(outputArray[1])
+                    } catch (e) {
+                        console.error('Error parsing artifacts from tool')
+                    }
+                }
+
                 return new ToolMessage({
                     name: tool.name,
                     content: typeof output === 'string' ? output : JSON.stringify(output),
                     tool_call_id: call.id!,
                     additional_kwargs: {
                         sourceDocuments,
+                        artifacts,
                         args: call.args,
                         usedTools: [
                             {
