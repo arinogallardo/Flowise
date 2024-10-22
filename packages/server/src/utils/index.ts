@@ -38,6 +38,7 @@ import { ChatMessage } from '../database/entities/ChatMessage'
 import { Credential } from '../database/entities/Credential'
 import { Tool } from '../database/entities/Tool'
 import { Assistant } from '../database/entities/Assistant'
+import { Lead } from '../database/entities/Lead'
 import { DataSource } from 'typeorm'
 import { CachePool } from '../CachePool'
 import { Variable } from '../database/entities/Variable'
@@ -55,6 +56,7 @@ export const databaseEntities: IDatabaseEntity = {
     ChatMessage: ChatMessage,
     Tool: Tool,
     Credential: Credential,
+    Lead: Lead,
     Assistant: Assistant,
     Variable: Variable,
     DocumentStore: DocumentStore,
@@ -428,6 +430,7 @@ type BuildFlowParams = {
     chatId: string
     sessionId: string
     chatflowid: string
+    apiMessageId: string
     appDataSource: DataSource
     overrideConfig?: ICommonObject
     cachePool?: CachePool
@@ -450,6 +453,7 @@ export const buildFlow = async ({
     componentNodes,
     question,
     chatHistory,
+    apiMessageId,
     chatId,
     sessionId,
     chatflowid,
@@ -522,6 +526,7 @@ export const buildFlow = async ({
                     sessionId,
                     chatflowid,
                     chatHistory,
+                    apiMessageId,
                     logger,
                     appDataSource,
                     databaseEntities,
@@ -1190,6 +1195,7 @@ export const isFlowValidForStream = (reactFlowNodes: IReactFlowNode[], endingNod
             'awsChatBedrock',
             'chatMistralAI',
             'chatMistral_LlamaIndex',
+            'chatAlibabaTongyi',
             'groqChat',
             'chatGroq_LlamaIndex',
             'chatCohere',

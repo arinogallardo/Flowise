@@ -1,4 +1,5 @@
 import { Request } from 'express'
+import * as path from 'path'
 import {
     IFileUpload,
     convertSpeechToText,
@@ -6,6 +7,8 @@ import {
     addSingleFileToStorage,
     addArrayFilesToStorage,
     mapMimeTypeToInputField,
+    mapExtToInputField,
+    generateFollowUpPrompts,
     IServerSideEventStreamer
 } from 'flowise-components'
 import { StatusCodes } from 'http-status-codes'
@@ -151,15 +154,45 @@ export const utilBuildChatflow = async (req: Request, isInternal: boolean = fals
 
                 const storagePath = await addArrayFilesToStorage(file.mimetype, fileBuffer, file.originalname, fileNames, chatflowid)
 
-                const fileInputField = mapMimeTypeToInputField(file.mimetype)
+                const fileInputFieldFromMimeType = mapMimeTypeToInputField(file.mimetype)
 
-                overrideConfig[fileInputField] = storagePath
+                const fileExtension = path.extname(file.originalname)
+
+                const fileInputFieldFromExt = mapExtToInputField(fileExtension)
+
+                let fileInputField = 'txtFile'
+
+                if (fileInputFieldFromExt !== 'txtFile') {
+                    fileInputField = fileInputFieldFromExt
+                } else if (fileInputFieldFromMimeType !== 'txtFile') {
+                    fileInputField = fileInputFieldFromExt
+                }
+
+                if (overrideConfig[fileInputField]) {
+                    const existingFileInputField = overrideConfig[fileInputField].replace('FILE-STORAGE::', '')
+                    const existingFileInputFieldArray = JSON.parse(existingFileInputField)
+
+                    const newFileInputField = storagePath.replace('FILE-STORAGE::', '')
+                    const newFileInputFieldArray = JSON.parse(newFileInputField)
+
+                    const updatedFieldArray = existingFileInputFieldArray.concat(newFileInputFieldArray)
+
+                    overrideConfig[fileInputField] = `FILE-STORAGE::${JSON.stringify(updatedFieldArray)}`
+                } else {
+                    overrideConfig[fileInputField] = storagePath
+                }
 
                 fs.unlinkSync(file.path)
+            }
+            if (overrideConfig.vars && typeof overrideConfig.vars === 'string') {
+                overrideConfig.vars = JSON.parse(overrideConfig.vars)
             }
             incomingInput = {
                 question: req.body.question ?? 'hello',
                 overrideConfig
+            }
+            if (req.body.chatId) {
+                incomingInput.chatId = req.body.chatId
             }
         }
 
@@ -168,6 +201,8 @@ export const utilBuildChatflow = async (req: Request, isInternal: boolean = fals
         const parsedFlowData: IReactFlowObject = JSON.parse(flowData)
         const nodes = parsedFlowData.nodes
         const edges = parsedFlowData.edges
+
+        const apiMessageId = uuidv4()
 
         /*** Get session ID ***/
         const memoryNode = findMemoryNode(nodes, edges)
@@ -184,6 +219,7 @@ export const utilBuildChatflow = async (req: Request, isInternal: boolean = fals
                 chatflow,
                 isInternal,
                 chatId,
+                apiMessageId,
                 memoryType ?? '',
                 sessionId,
                 userMessageDateTime,
@@ -306,6 +342,7 @@ export const utilBuildChatflow = async (req: Request, isInternal: boolean = fals
                 reactFlowEdges: edges,
                 graph,
                 depthQueue,
+                apiMessageId,
                 componentNodes: appServer.nodesPool.componentNodes,
                 question: incomingInput.question,
                 chatHistory,
@@ -336,6 +373,7 @@ export const utilBuildChatflow = async (req: Request, isInternal: boolean = fals
                 chatflowid,
                 chatId,
                 sessionId,
+                apiMessageId,
                 chatHistory,
                 ...incomingInput.overrideConfig
             }
@@ -359,29 +397,25 @@ export const utilBuildChatflow = async (req: Request, isInternal: boolean = fals
         const nodeModule = await import(nodeInstanceFilePath)
         const nodeInstance = new nodeModule.nodeClass({ sessionId })
 
-        let result = isStreamValid
-            ? await nodeInstance.run(nodeToExecuteData, incomingInput.question, {
-                  chatId,
-                  chatflowid,
-                  logger,
-                  appDataSource: appServer.AppDataSource,
-                  databaseEntities,
-                  analytic: chatflow.analytic,
-                  uploads: incomingInput.uploads,
-                  prependMessages,
-                  sseStreamer: appServer.sseStreamer,
-                  shouldStreamResponse: isStreamValid
-              })
-            : await nodeInstance.run(nodeToExecuteData, incomingInput.question, {
-                  chatId,
-                  chatflowid,
-                  logger,
-                  appDataSource: appServer.AppDataSource,
-                  databaseEntities,
-                  analytic: chatflow.analytic,
-                  uploads: incomingInput.uploads,
-                  prependMessages
-              })
+        isStreamValid = (req.body.streaming === 'true' || req.body.streaming === true) && isStreamValid
+
+        const runParams = {
+            chatId,
+            chatflowid,
+            apiMessageId,
+            logger,
+            appDataSource: appServer.AppDataSource,
+            databaseEntities,
+            analytic: chatflow.analytic,
+            uploads: incomingInput.uploads,
+            prependMessages
+        }
+
+        let result = await nodeInstance.run(nodeToExecuteData, incomingInput.question, {
+            ...runParams,
+            ...(isStreamValid && { sseStreamer: appServer.sseStreamer, shouldStreamResponse: true })
+        })
+
         result = typeof result === 'string' ? { text: result } : result
 
         // Retrieve threadId from assistant if exists
@@ -408,7 +442,8 @@ export const utilBuildChatflow = async (req: Request, isInternal: boolean = fals
         else if (result.json) resultText = '```json\n' + JSON.stringify(result.json, null, 2)
         else resultText = JSON.stringify(result, null, 2)
 
-        const apiMessage: Omit<IChatMessage, 'id' | 'createdDate'> = {
+        const apiMessage: Omit<IChatMessage, 'createdDate'> = {
+            id: apiMessageId,
             role: 'apiMessage',
             content: resultText,
             chatflowid,
@@ -421,6 +456,18 @@ export const utilBuildChatflow = async (req: Request, isInternal: boolean = fals
         if (result?.usedTools) apiMessage.usedTools = JSON.stringify(result.usedTools)
         if (result?.fileAnnotations) apiMessage.fileAnnotations = JSON.stringify(result.fileAnnotations)
         if (result?.artifacts) apiMessage.artifacts = JSON.stringify(result.artifacts)
+        if (chatflow.followUpPrompts) {
+            const followUpPromptsConfig = JSON.parse(chatflow.followUpPrompts)
+            const followUpPrompts = await generateFollowUpPrompts(followUpPromptsConfig, apiMessage.content, {
+                chatId,
+                chatflowid,
+                appDataSource: appServer.AppDataSource,
+                databaseEntities
+            })
+            if (followUpPrompts?.questions) {
+                apiMessage.followUpPrompts = JSON.stringify(followUpPrompts.questions)
+            }
+        }
 
         const chatMessage = await utilAddChatMessage(apiMessage)
 
@@ -439,6 +486,7 @@ export const utilBuildChatflow = async (req: Request, isInternal: boolean = fals
         result.question = incomingInput.question
         result.chatId = chatId
         result.chatMessageId = chatMessage?.id
+        result.followUpPrompts = JSON.stringify(apiMessage.followUpPrompts)
         result.isStreamValid = isStreamValid
 
         if (sessionId) result.sessionId = sessionId
@@ -459,6 +507,7 @@ const utilBuildAgentResponse = async (
     agentflow: IChatFlow,
     isInternal: boolean,
     chatId: string,
+    apiMessageId: string,
     memoryType: string,
     sessionId: string,
     userMessageDateTime: Date,
@@ -475,6 +524,7 @@ const utilBuildAgentResponse = async (
         const streamResults = await buildAgentGraph(
             agentflow,
             chatId,
+            apiMessageId,
             sessionId,
             incomingInput,
             isInternal,
@@ -498,7 +548,8 @@ const utilBuildAgentResponse = async (
             }
             await utilAddChatMessage(userMessage)
 
-            const apiMessage: Omit<IChatMessage, 'id' | 'createdDate'> = {
+            const apiMessage: Omit<IChatMessage, 'createdDate'> = {
+                id: apiMessageId,
                 role: 'apiMessage',
                 content: finalResult,
                 chatflowid: agentflow.id,
@@ -512,6 +563,18 @@ const utilBuildAgentResponse = async (
             if (usedTools?.length) apiMessage.usedTools = JSON.stringify(usedTools)
             if (agentReasoning?.length) apiMessage.agentReasoning = JSON.stringify(agentReasoning)
             if (finalAction && Object.keys(finalAction).length) apiMessage.action = JSON.stringify(finalAction)
+            if (agentflow.followUpPrompts) {
+                const followUpPromptsConfig = JSON.parse(agentflow.followUpPrompts)
+                const generatedFollowUpPrompts = await generateFollowUpPrompts(followUpPromptsConfig, apiMessage.content, {
+                    chatId,
+                    chatflowid: agentflow.id,
+                    appDataSource: appServer.AppDataSource,
+                    databaseEntities
+                })
+                if (generatedFollowUpPrompts?.questions) {
+                    apiMessage.followUpPrompts = JSON.stringify(generatedFollowUpPrompts.questions)
+                }
+            }
             const chatMessage = await utilAddChatMessage(apiMessage)
 
             await appServer.telemetry.sendTelemetry('agentflow_prediction_sent', {
@@ -560,6 +623,7 @@ const utilBuildAgentResponse = async (
             if (memoryType) result.memoryType = memoryType
             if (agentReasoning?.length) result.agentReasoning = agentReasoning
             if (finalAction && Object.keys(finalAction).length) result.action = finalAction
+            result.followUpPrompts = JSON.stringify(apiMessage.followUpPrompts)
 
             return result
         }
